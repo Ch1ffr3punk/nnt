@@ -12,32 +12,31 @@ struct Cli {
     proxy: Option<String>,
 
     /// Mixnodes: Node-ID, Country, IP, Hostname, Family
-    #[arg(short = 'm', long, conflicts_with_all = &["gateways", "network_requesters"])]
+    #[arg(short = 'm', long, conflicts_with_all = &["gateways", "network_requesters", "families", "all"])]
     mixnodes: bool,
 
     /// Gateways: Node-ID, Country, IP, Hostname, Roles, Family
-    #[arg(short = 'g', long, conflicts_with_all = &["mixnodes", "network_requesters"])]
+    #[arg(short = 'g', long, conflicts_with_all = &["mixnodes", "network_requesters", "families", "all"])]
     gateways: bool,
 
-    /// Network Requesters: Node-ID, Country, IP, Family, Nym Address
-    #[arg(short = 'n', long, conflicts_with_all = &["mixnodes", "gateways"])]
+    /// Network Requesters: Node-ID, Country, Nym Address
+    #[arg(short = 'n', long, conflicts_with_all = &["mixnodes", "gateways", "families", "all", "geo"])]
     network_requesters: bool,
+
+    /// Families: Family, Node-ID, Country, IPv4, Role (gateway/mixnode)
+    #[arg(short = 'f', long, conflicts_with_all = &["mixnodes", "gateways", "network_requesters", "all"])]
+    families: bool,
+
+    /// All nodes: Family/Name, Node-ID, Country, IPv4, Role (gateway/mixnode)
+    #[arg(short = 'a', long, conflicts_with_all = &["mixnodes", "gateways", "network_requesters", "families"])]
+    all: bool,
+
+    /// With -m/-g/-f/-a: also lookup and show Latitude / Longitude for each IPv4 (via ip-api.com)
+    #[arg(long)]
+    geo: bool,
 }
 
 const BASE_URL: &str = "https://validator.nymtech.net";
-const VERIFIED_ENDPOINTS: &[&str] = &[
-    "/api/v1/circulating-supply",
-    "/api/v1/epoch/current",
-    "/api/v1/nym-nodes/rewarded-set",
-    "/api/v1/nym-nodes/described",
-    "/api/v1/network/chain-status",
-    "/api/v1/ecash/aggregated-coin-indices-signatures",
-    "/api/v1/unstable/nym-nodes/skimmed/entry-gateways/all",
-    "/api/v1/unstable/nym-nodes/skimmed/mixnodes/active",
-    "/api/v1/status",
-    "/api/v1/mixnodes",
-    "/api/v1/gateways",
-];
 
 #[derive(Deserialize, Clone)]
 struct NymNodesDescribed {
@@ -97,8 +96,6 @@ struct IpPacketRouter {
     address: String,
 }
 
-// --- Node Families ---
-
 #[derive(Deserialize, Clone)]
 struct FamiliesResponse {
     data: Vec<NodeFamily>,
@@ -106,7 +103,6 @@ struct FamiliesResponse {
 
 #[derive(Deserialize, Clone)]
 struct NodeFamily {
-    // id: u32,
     name: String,
     members: Vec<FamilyMember>,
 }
@@ -138,7 +134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             fetch_nodes(&client),
             fetch_family_map(&client)
         )?;
-        print_mixnodes(&nodes.data, &family_map);
+        print_mixnodes(&nodes.data, &family_map, cli.geo, &client).await?;
         return Ok(());
     }
 
@@ -147,7 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             fetch_nodes(&client),
             fetch_family_map(&client)
         )?;
-        print_gateways(&nodes.data, &family_map);
+        print_gateways(&nodes.data, &family_map, cli.geo, &client).await?;
         return Ok(());
     }
 
@@ -160,37 +156,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Default: alle Endpoints als JSON ausgeben
-    eprintln!("Fetching all endpoints...");
-
-    let mut collected_data = serde_json::Map::new();
-    let total = VERIFIED_ENDPOINTS.len();
-
-    for (i, endpoint) in VERIFIED_ENDPOINTS.iter().enumerate() {
-        let url = format!("{}{}", BASE_URL, endpoint);
-        eprintln!("[{}/{}] Fetching: {}", i + 1, total, url);
-
-        match query_endpoint(&client, &url).await {
-            Ok(data) => {
-                let key = endpoint.trim_start_matches("/api/v1/").replace("/", "_");
-                collected_data.insert(key, data);
-                eprintln!("  OK");
-            }
-            Err(e) => {
-                eprintln!("  ERROR: {}", e);
-                let key = endpoint.trim_start_matches("/api/v1/").replace("/", "_");
-                collected_data.insert(key, Value::Null);
-            }
-        }
+    if cli.families {
+        let (nodes, family_map) = tokio::try_join!(
+            fetch_nodes(&client),
+            fetch_family_map(&client)
+        )?;
+        print_families(&client, &nodes.data, &family_map, cli.geo).await?;
+        return Ok(());
     }
 
-    let combined = Value::Object(collected_data);
-    println!("{}", serde_json::to_string_pretty(&combined)?);
+    if cli.all {
+        let (nodes, family_map) = tokio::try_join!(
+            fetch_nodes(&client),
+            fetch_family_map(&client)
+        )?;
+        print_all(&client, &nodes.data, &family_map, cli.geo).await?;
+        return Ok(());
+    }
 
+    eprintln!("No view selected. Use -m, -g, -n, -f, or -a");
     Ok(())
 }
 
-/// Fetch node descriptions from the described endpoint.
 async fn fetch_nodes(
     client: &reqwest::Client,
 ) -> Result<NymNodesDescribed, Box<dyn std::error::Error>> {
@@ -199,14 +186,12 @@ async fn fetch_nodes(
     Ok(nodes)
 }
 
-/// Loads all node families and builds a map: node_id → family name
 async fn fetch_family_map(
     client: &reqwest::Client,
 ) -> Result<HashMap<u32, String>, Box<dyn std::error::Error>> {
     let url = format!("{}/api/v1/node-families", BASE_URL);
     let data = query_endpoint(client, &url).await?;
     let families: FamiliesResponse = serde_json::from_value(data)?;
-
     let mut map = HashMap::new();
     for family in families.data {
         for member in family.members {
@@ -219,24 +204,21 @@ async fn fetch_family_map(
 fn node_roles(n: &Node) -> Vec<&'static str> {
     let mut roles = Vec::new();
     let r = &n.description.declared_role;
-
-    if r.mixnode  { roles.push("Mixnode"); }
-    if r.entry    { roles.push("Entry"); }
+    if r.mixnode { roles.push("Mixnode"); }
+    if r.entry { roles.push("Entry"); }
     if r.exit_ipr { roles.push("Exit-IPR"); }
-    if r.exit_nr  { roles.push("Exit-NR"); }
-
+    if r.exit_nr { roles.push("Exit-NR"); }
     if n.description.network_requester.as_ref().map_or(false, |nr| !nr.address.is_empty()) {
         roles.push("Network-Requester");
     }
     if n.description.ip_packet_router.as_ref().map_or(false, |ipr| !ipr.address.is_empty()) {
         roles.push("IP-Packet-Router");
     }
-
     if roles.is_empty() { roles.push("-"); }
     roles
 }
 
-fn print_table(title: &str, headers: &[&str], rows: &[Vec<String>]) {
+fn print_table(title: &str, headers: &[&str], rows: &[Vec<String>], right_align: bool) {
     let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
@@ -252,88 +234,213 @@ fn print_table(title: &str, headers: &[&str], rows: &[Vec<String>]) {
     println!("\n{}", title);
     println!("{}", "=".repeat(line_len));
 
-    let header_cells: Vec<String> = headers.iter().zip(&widths)
-        .map(|(h, w)| format!("{:<width$}", h, width = *w))
+    let header_cells: Vec<String> = headers.iter().enumerate().zip(&widths)
+        .map(|((i, h), w)| {
+            if right_align && i > 0 {
+                format!("{:>width$}", h, width = *w)
+            } else {
+                format!("{:<width$}", h, width = *w)
+            }
+        })
         .collect();
     println!("{}", header_cells.join(gap));
     println!("{}", "-".repeat(line_len));
 
     for row in rows {
-        let cells: Vec<String> = row.iter().zip(&widths)
-            .map(|(c, w)| format!("{:<width$}", c, width = *w))
+        let cells: Vec<String> = row.iter().enumerate().zip(&widths)
+            .map(|((i, c), w)| {
+                if right_align && i > 0 {
+                    format!("{:>width$}", c, width = *w)
+                } else {
+                    format!("{:<width$}", c, width = *w)
+                }
+            })
             .collect();
         println!("{}", cells.join(gap));
     }
     println!();
 }
 
-fn print_mixnodes(nodes: &[Node], family_map: &HashMap<u32, String>) {
+async fn print_mixnodes(
+    nodes: &[Node],
+    family_map: &HashMap<u32, String>,
+    with_geo: bool,
+    client: &reqwest::Client,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut items: Vec<&Node> = nodes.iter()
         .filter(|n| n.description.declared_role.mixnode)
         .collect();
+
     items.sort_by_key(|n| n.node_id);
+
+    let geo_map = if with_geo {
+        let unique_ips: Vec<String> = items.iter()
+            .flat_map(|n| {
+                n.description.host_information.ip_address.iter()
+                    .filter(|ip| is_ipv4(ip))
+                    .cloned()
+            })
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        eprintln!("Looking up geo coordinates for {} unique IPv4 addresses...", unique_ips.len());
+        fetch_geo_coords(client, &unique_ips).await?
+    } else {
+        HashMap::new()
+    };
 
     let rows: Vec<Vec<String>> = items.iter().map(|n| {
         let country = n.description.auxiliary_details.location
-            .clone().unwrap_or_else(|| "??".to_string());
+            .clone()
+            .map(|c| strip_emojis(&c))
+            .unwrap_or_else(|| "??".to_string());
         let ip = if n.description.host_information.ip_address.is_empty() {
             "-".to_string()
         } else {
             n.description.host_information.ip_address.join(", ")
         };
         let host = n.description.host_information.hostname
-            .clone().unwrap_or_else(|| "-".to_string());
+            .clone()
+            .map(|h| strip_emojis(&h))
+            .unwrap_or_else(|| "-".to_string());
         let family = family_map
             .get(&n.node_id)
-            .cloned()
+            .map(|f| strip_emojis(f))
             .unwrap_or_else(|| "-".to_string());
 
-        vec![n.node_id.to_string(), country, ip, host, family]
+        let mut row = vec![
+            n.node_id.to_string(),
+            country,
+            ip.clone(),
+            host,
+            family,
+        ];
+
+        if with_geo {
+            let ipv4s: Vec<&str> = n.description.host_information.ip_address
+                .iter()
+                .filter(|ip| is_ipv4(ip))
+                .map(|s| s.as_str())
+                .collect();
+            let (lat_s, lon_s) = if let Some(first_ip) = ipv4s.first() {
+                if let Some(&(lat, lon)) = geo_map.get(*first_ip) {
+                    (format!("{:.4}", lat), format!("{:.4}", lon))
+                } else {
+                    ("-".to_string(), "-".to_string())
+                }
+            } else {
+                ("-".to_string(), "-".to_string())
+            };
+            row.push(lat_s);
+            row.push(lon_s);
+        }
+
+        row
     }).collect();
 
-    print_table(
-        "MIXNODES",
-        &["Node-ID", "Country", "IP Address", "Hostname", "Family"],
-        &rows,
-    );
+    let headers: &[&str] = if with_geo {
+        &["Node-ID", "Country", "IP Address", "Hostname", "Family", "Lat", "Lon"]
+    } else {
+        &["Node-ID", "Country", "IP Address", "Hostname", "Family"]
+    };
+
+    print_table("MIXNODES", headers, &rows, false);
+    Ok(())
 }
 
-fn print_gateways(nodes: &[Node], family_map: &HashMap<u32, String>) {
+async fn print_gateways(
+    nodes: &[Node],
+    family_map: &HashMap<u32, String>,
+    with_geo: bool,
+    client: &reqwest::Client,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut items: Vec<&Node> = nodes.iter()
         .filter(|n| {
             let r = &n.description.declared_role;
             r.entry || r.exit_ipr || r.exit_nr
         })
         .collect();
+
     items.sort_by_key(|n| n.node_id);
+
+    let geo_map = if with_geo {
+        let unique_ips: Vec<String> = items.iter()
+            .flat_map(|n| {
+                n.description.host_information.ip_address.iter()
+                    .filter(|ip| is_ipv4(ip))
+                    .cloned()
+            })
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        eprintln!("Looking up geo coordinates for {} unique IPv4 addresses...", unique_ips.len());
+        fetch_geo_coords(client, &unique_ips).await?
+    } else {
+        HashMap::new()
+    };
 
     let rows: Vec<Vec<String>> = items.iter().map(|n| {
         let country = n.description.auxiliary_details.location
-            .clone().unwrap_or_else(|| "??".to_string());
+            .clone()
+            .map(|c| strip_emojis(&c))
+            .unwrap_or_else(|| "??".to_string());
         let ip = if n.description.host_information.ip_address.is_empty() {
             "-".to_string()
         } else {
             n.description.host_information.ip_address.join(", ")
         };
         let host = n.description.host_information.hostname
-            .clone().unwrap_or_else(|| "-".to_string());
+            .clone()
+            .map(|h| strip_emojis(&h))
+            .unwrap_or_else(|| "-".to_string());
         let roles = node_roles(n).join(", ");
         let family = family_map
             .get(&n.node_id)
-            .cloned()
+            .map(|f| strip_emojis(f))
             .unwrap_or_else(|| "-".to_string());
 
-        vec![n.node_id.to_string(), country, ip, host, roles, family]
+        let mut row = vec![
+            n.node_id.to_string(),
+            country,
+            ip.clone(),
+            host,
+            roles,
+            family,
+        ];
+
+        if with_geo {
+            let ipv4s: Vec<&str> = n.description.host_information.ip_address
+                .iter()
+                .filter(|ip| is_ipv4(ip))
+                .map(|s| s.as_str())
+                .collect();
+            let (lat_s, lon_s) = if let Some(first_ip) = ipv4s.first() {
+                if let Some(&(lat, lon)) = geo_map.get(*first_ip) {
+                    (format!("{:.4}", lat), format!("{:.4}", lon))
+                } else {
+                    ("-".to_string(), "-".to_string())
+                }
+            } else {
+                ("-".to_string(), "-".to_string())
+            };
+            row.push(lat_s);
+            row.push(lon_s);
+        }
+
+        row
     }).collect();
 
-    print_table(
-        "GATEWAYS",
-        &["Node-ID", "Country", "IP Address", "Hostname", "Roles", "Family"],
-        &rows,
-    );
+    let headers: &[&str] = if with_geo {
+        &["Node-ID", "Country", "IP Address", "Hostname", "Roles", "Family", "Lat", "Lon"]
+    } else {
+        &["Node-ID", "Country", "IP Address", "Hostname", "Roles", "Family"]
+    };
+
+    print_table("GATEWAYS", headers, &rows, false);
+    Ok(())
 }
 
-fn print_network_requesters(nodes: &[Node], family_map: &HashMap<u32, String>) {
+fn print_network_requesters(nodes: &[Node], _family_map: &HashMap<u32, String>) {
     let mut items: Vec<(&Node, &NetworkRequester)> = nodes.iter()
         .filter_map(|n| {
             let nr = n.description.network_requester.as_ref()?;
@@ -341,37 +448,285 @@ fn print_network_requesters(nodes: &[Node], family_map: &HashMap<u32, String>) {
             Some((n, nr))
         })
         .collect();
+
     items.sort_by_key(|(n, _)| n.node_id);
 
     let rows: Vec<Vec<String>> = items.iter().map(|(n, nr)| {
         let country = n.description.auxiliary_details.location
-            .clone().unwrap_or_else(|| "??".to_string());
-        let ip = if n.description.host_information.ip_address.is_empty() {
-            "-".to_string()
-        } else {
-            n.description.host_information.ip_address.join(", ")
-        };
-        let family = family_map
-            .get(&n.node_id)
-            .cloned()
-            .unwrap_or_else(|| "-".to_string());
+            .clone()
+            .map(|c| strip_emojis(&c))
+            .unwrap_or_else(|| "??".to_string());
 
         vec![
             n.node_id.to_string(),
             country,
-            ip,
-            family,
             nr.address.clone(),
         ]
     }).collect();
 
     print_table(
         "NETWORK REQUESTERS - Nym address for nym-socks5-client --provider",
-        &["Node-ID", "Country", "IP Address", "Family", "Nym Address (--provider)"],
+        &["Node-ID", "Country", "Nym Address (--provider)"],
         &rows,
+        false,
     );
-
     println!("Tip:  nym-socks5-client init --id <ID> --provider <Nym-Address>");
+}
+
+fn is_ipv4(ip: &str) -> bool {
+    ip.contains('.') && !ip.contains(':')
+}
+
+fn strip_emojis(s: &str) -> String {
+    s.chars()
+        .filter(|&c| {
+            let u = c as u32;
+            !(matches!(u,
+                0x1F300..=0x1FAFF |
+                0x2600..=0x27BF  |
+                0x2300..=0x23FF  |
+                0x2B00..=0x2BFF  |
+                0xFE00..=0xFE0F  |
+                0x1F000..=0x1F02F |
+                0x1F0A0..=0x1F0FF |
+                0xE0000..=0xE007F
+            ) || c.is_control())
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[derive(Deserialize)]
+struct IpApiResult {
+    status: String,
+    query: Option<String>,
+    lat: Option<f64>,
+    lon: Option<f64>,
+}
+
+async fn fetch_geo_coords(
+    client: &reqwest::Client,
+    ips: &[String],
+) -> Result<HashMap<String, (f64, f64)>, Box<dyn std::error::Error>> {
+    let mut map = HashMap::new();
+    if ips.is_empty() {
+        return Ok(map);
+    }
+
+    const BATCH_SIZE: usize = 100;
+    for (i, chunk) in ips.chunks(BATCH_SIZE).enumerate() {
+        if i > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        }
+        eprintln!("  Geo lookup batch {}/{} ({} IPs)...", i + 1, (ips.len() + BATCH_SIZE - 1) / BATCH_SIZE, chunk.len());
+        let body = serde_json::to_value(chunk)?;
+        let resp = client
+            .post("http://ip-api.com/batch?fields=status,query,lat,lon")
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            eprintln!("  Warning: geo batch HTTP {}", resp.status());
+            continue;
+        }
+        let results: Vec<IpApiResult> = resp.json().await?;
+        for r in results {
+            if r.status == "success" {
+                if let (Some(q), Some(lat), Some(lon)) = (r.query, r.lat, r.lon) {
+                    map.insert(q, (lat, lon));
+                }
+            }
+        }
+    }
+    Ok(map)
+}
+
+async fn print_families(
+    client: &reqwest::Client,
+    nodes: &[Node],
+    family_map: &HashMap<u32, String>,
+    with_geo: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut items: Vec<(&Node, &str, String)> = nodes.iter()
+        .filter_map(|n| {
+            let family_raw = family_map.get(&n.node_id)?;
+            let r = &n.description.declared_role;
+            let is_mix = r.mixnode;
+            let is_gw = r.entry || r.exit_ipr || r.exit_nr;
+            if !is_mix && !is_gw {
+                return None;
+            }
+            let role = if is_mix { "mixnode" } else { "gateway" };
+            let family_clean = strip_emojis(family_raw);
+            Some((n, role, family_clean))
+        })
+        .collect();
+
+    items.sort_by(|a, b| {
+        a.2.cmp(&b.2).then_with(|| a.0.node_id.cmp(&b.0.node_id))
+    });
+
+    let geo_map = if with_geo {
+        let mut unique_ips: Vec<String> = items.iter()
+            .flat_map(|(n, _, _)| {
+                n.description.host_information.ip_address.iter()
+                    .filter(|ip| is_ipv4(ip))
+                    .cloned()
+            })
+            .collect();
+        unique_ips.sort();
+        unique_ips.dedup();
+        eprintln!("Looking up geo coordinates for {} unique IPv4 addresses...", unique_ips.len());
+        fetch_geo_coords(client, &unique_ips).await?
+    } else {
+        HashMap::new()
+    };
+
+    let rows: Vec<Vec<String>> = items.iter().map(|(n, role, family)| {
+        let country = n.description.auxiliary_details.location
+            .clone()
+            .map(|c| strip_emojis(&c))
+            .unwrap_or_else(|| "??".to_string());
+        let ipv4s: Vec<&str> = n.description.host_information.ip_address
+            .iter()
+            .filter(|ip| is_ipv4(ip))
+            .map(|s| s.as_str())
+            .collect();
+        let ip = if ipv4s.is_empty() {
+            "-".to_string()
+        } else {
+            ipv4s.join(", ")
+        };
+
+        let mut row = vec![
+            family.clone(),
+            n.node_id.to_string(),
+            country,
+            ip.clone(),
+        ];
+
+        if with_geo {
+            let (lat_s, lon_s) = if let Some(first_ip) = ipv4s.first() {
+                if let Some(&(lat, lon)) = geo_map.get(*first_ip) {
+                    (format!("{:.4}", lat), format!("{:.4}", lon))
+                } else {
+                    ("-".to_string(), "-".to_string())
+                }
+            } else {
+                ("-".to_string(), "-".to_string())
+            };
+            row.push(lat_s);
+            row.push(lon_s);
+        }
+
+        row.push(role.to_string());
+        row
+    }).collect();
+
+    let headers: &[&str] = if with_geo {
+        &["Family", "Node-ID", "Country", "IP Address (v4)", "Lat", "Lon", "Role"]
+    } else {
+        &["Family", "Node-ID", "Country", "IP Address (v4)", "Role"]
+    };
+
+    print_table("FAMILIES", headers, &rows, true);
+    Ok(())
+}
+
+async fn print_all(
+    client: &reqwest::Client,
+    nodes: &[Node],
+    family_map: &HashMap<u32, String>,
+    with_geo: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut items: Vec<(&Node, String, &str)> = nodes.iter()
+        .filter_map(|n| {
+            let r = &n.description.declared_role;
+            let is_mix = r.mixnode;
+            let is_gw = r.entry || r.exit_ipr || r.exit_nr;
+            if !is_mix && !is_gw {
+                return None;
+            }
+            let role = if is_mix { "mixnode" } else { "gateway" };
+            let family = family_map
+                .get(&n.node_id)
+                .map(|f| strip_emojis(f))
+                .unwrap_or_else(|| "-".to_string());
+            Some((n, family, role))
+        })
+        .collect();
+
+    items.sort_by(|a, b| {
+        a.1.cmp(&b.1).then_with(|| a.0.node_id.cmp(&b.0.node_id))
+    });
+
+    let geo_map = if with_geo {
+        let unique_ips: Vec<String> = items.iter()
+            .flat_map(|(n, _, _)| {
+                n.description.host_information.ip_address.iter()
+                    .filter(|ip| is_ipv4(ip))
+                    .cloned()
+            })
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        eprintln!("Looking up geo coordinates for {} unique IPv4 addresses...", unique_ips.len());
+        fetch_geo_coords(client, &unique_ips).await?
+    } else {
+        HashMap::new()
+    };
+
+    let rows: Vec<Vec<String>> = items.iter().map(|(n, family, role)| {
+        let country = n.description.auxiliary_details.location
+            .clone()
+            .map(|c| strip_emojis(&c))
+            .unwrap_or_else(|| "??".to_string());
+        let ipv4s: Vec<&str> = n.description.host_information.ip_address
+            .iter()
+            .filter(|ip| is_ipv4(ip))
+            .map(|s| s.as_str())
+            .collect();
+        let ip = if ipv4s.is_empty() {
+            "-".to_string()
+        } else {
+            ipv4s.join(", ")
+        };
+
+        let mut row = vec![
+            family.clone(),
+            n.node_id.to_string(),
+            country,
+            ip.clone(),
+            role.to_string(),
+        ];
+
+        if with_geo {
+            let (lat_s, lon_s) = if let Some(first_ip) = ipv4s.first() {
+                if let Some(&(lat, lon)) = geo_map.get(*first_ip) {
+                    (format!("{:.4}", lat), format!("{:.4}", lon))
+                } else {
+                    ("-".to_string(), "-".to_string())
+                }
+            } else {
+                ("-".to_string(), "-".to_string())
+            };
+            row.push(lat_s);
+            row.push(lon_s);
+        }
+
+        row
+    }).collect();
+
+    let headers: &[&str] = if with_geo {
+        &["Family/Name", "Node-ID", "Country", "IP (v4)", "Role", "Lat", "Lon"]
+    } else {
+        &["Family/Name", "Node-ID", "Country", "IP (v4)", "Role"]
+    };
+
+    print_table("ALL NODES", headers, &rows, true);
+    Ok(())
 }
 
 fn find_pagination_mut(v: &mut Value) -> Option<&mut Value> {
@@ -430,7 +785,6 @@ async fn query_endpoint(client: &reqwest::Client, url: &str) -> Result<Value, Bo
         }
 
         let mut data: Value = response.json().await?;
-
         if page == 0 {
             base_json = Some(data.clone());
         }

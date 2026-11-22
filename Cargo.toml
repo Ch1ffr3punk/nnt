@@ -7,11 +7,11 @@ description = "Nym Network Topology"
 license = "Apache 2.0"
 
 [dependencies]
-reqwest = { version = "0.13", features = ["json", "rustls", "socks"] }
-tokio = { version = "1.0", features = ["full"] }
-clap = { version = "4.0", features = ["derive"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "socks", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
 
 [profile.release]
 opt-level = "z"
