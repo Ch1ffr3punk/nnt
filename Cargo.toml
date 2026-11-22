@@ -1,0 +1,21 @@
+[package]
+name = "nnt"
+version = "0.1.0"
+edition = "2021"
+authors = ["Ch1ffr3punk"]
+description = "Nym Network Topology"
+license = "Apache 2.0"
+
+[dependencies]
+reqwest = { version = "0.13", features = ["json", "rustls", "socks"] }
+tokio = { version = "1.0", features = ["full"] }
+clap = { version = "4.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
